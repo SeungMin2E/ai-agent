@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime
 import ipaddress
+import importlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -222,12 +223,28 @@ def extract_result(output):
     raise SetupError('Helper returned no result. Inspect its log for a dependency failure or crash.')
 
 
+def load_vllm_extension():
+    """CUDA wheels use the stable-libtorch module in recent vLLM releases."""
+    names = ('vllm._C_stable_libtorch', 'vllm._C')
+    for name in names:
+        try:
+            importlib.import_module(name)
+            return name
+        except ModuleNotFoundError as exc:
+            # Fall back only when this exact extension is absent. Missing dependencies,
+            # undefined symbols and shared-library errors must remain visible.
+            if exc.name != name:
+                raise
+    raise SetupError('No vLLM CUDA extension found (tried ' + ', '.join(names) + '). '
+                     'Inspect the installed vLLM GPU wheel and runtime logs.')
+
+
 def probe_worker(version):
     try:
         import importlib.metadata as metadata
         from packaging.version import Version
         import torch
-        import vllm._C
+        extension = load_vllm_extension()
         import transformers
         import huggingface_hub
         installed = metadata.version('vllm')
@@ -244,9 +261,15 @@ def probe_worker(version):
             emit({'ok':False,'hardware_error':True,'error':f'This profile needs a 32 GB-class GPU; CUDA reports {total/GIB:.1f} GiB.'}); return
         if not torch.version.cuda or Version(torch.version.cuda) < Version('12.8'):
             raise RuntimeError('Blackwell requires a CUDA 12.8+ PyTorch build.')
-        torch.ones(8,device='cuda').add_(1)
+        inputs = torch.ones((1,128),device='cuda',dtype=torch.float16)
+        weight = torch.ones(128,device='cuda',dtype=torch.float16)
+        output = torch.empty_like(inputs)
+        torch.ops._C.rms_norm(output,inputs,weight,1e-6)
         torch.cuda.synchronize()
+        if not torch.allclose(output,torch.ones_like(output),atol=1e-3,rtol=1e-3):
+            raise RuntimeError('vLLM CUDA RMSNorm verification returned an unexpected result.')
         emit({'ok':True,'python':sys.version.split()[0],'vllm':installed,'torch':torch.__version__,
+              'extension':extension,'kernel_check':'rms_norm',
               'cuda':torch.version.cuda,'transformers':transformers.__version__,
               'huggingface_hub':huggingface_hub.__version__,'gpu':torch.cuda.get_device_name(0),
               'free_bytes':free,'total_bytes':total})

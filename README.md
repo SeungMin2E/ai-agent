@@ -85,6 +85,7 @@ bash setup.sh
 ## 오류 처리
 
 - Python 3.10~3.13, GPU 드라이버, vLLM 확장 모듈, CUDA 커널 실행, GPU 종류·용량 확인.
+- vLLM 0.31의 `vllm._C_stable_libtorch` 확장을 우선 확인하고, 구버전은 `vllm._C`를 사용합니다. 확장 모듈 로드 후 vLLM RMSNorm CUDA 커널의 실행 결과도 검사합니다.
 - 호환되는 기존 환경 재사용. 새 설치는 별도 가상환경에서 수행하여 시스템 PyTorch를 덮어쓰지 않음.
 - 별도 런타임 설치 전 20GiB 여유 확인. 모델 다운로드 전 파일 크기·캐시를 대조하여 미다운로드 용량 + 3GiB 확인.
 - 네트워크 시간 초과 등 일시 오류만 제한 재시도. 401·403·404와 디스크 부족 등은 즉시 보고.
@@ -101,6 +102,7 @@ Linux에서는 새 상태 파일·로그를 현재 사용자만 읽도록 생성
 
 | 상황 | 조치 |
 | --- | --- |
+| `No module named 'vllm._C'` (예전 설치 스크립트) | 저장소에서 `git pull --ff-only` 후 `bash setup.sh` 재실행. vLLM 0.31의 확장 이름 변경을 반영한 검사 사용 |
 | 포트 사용 중 | 기존 vLLM 확인 또는 다른 `PORT` 사용 |
 | GPU 메모리 부족 | `nvidia-smi` 확인. 다른 작업 정리 후 `MAX_MODEL_LEN=4096`부터 재시도 |
 | venv 생성 실패 | venv/ensurepip가 포함된 Python 3.12 GPU 이미지 사용. Ubuntu는 필요 시 `python3-venv` 설치 |

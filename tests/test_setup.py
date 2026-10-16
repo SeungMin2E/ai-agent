@@ -140,6 +140,94 @@ class FailureHandlingTests(Base):
                 app.smoke(self.config)
 
 
+class RuntimeExtensionTests(Base):
+    def test_stable_libtorch_extension_does_not_require_legacy_module(self):
+        def importer(name):
+            if name == 'vllm._C_stable_libtorch':
+                return types.ModuleType(name)
+            raise ModuleNotFoundError('legacy module absent',name=name)
+        with patch.object(app.importlib,'import_module',side_effect=importer) as load:
+            self.assertEqual(app.load_vllm_extension(),'vllm._C_stable_libtorch')
+        load.assert_called_once_with('vllm._C_stable_libtorch')
+
+    def test_older_cuda_wheel_can_use_legacy_extension(self):
+        missing = ModuleNotFoundError('stable module absent',name='vllm._C_stable_libtorch')
+        with patch.object(app.importlib,'import_module',side_effect=[missing,types.ModuleType('vllm._C')]) as load:
+            self.assertEqual(app.load_vllm_extension(),'vllm._C')
+        self.assertEqual(load.call_count,2)
+
+    def test_missing_extensions_produce_actionable_failure(self):
+        def missing(name):
+            raise ModuleNotFoundError('absent',name=name)
+        with patch.object(app.importlib,'import_module',side_effect=missing),self.assertRaisesRegex(app.SetupError,'No vLLM CUDA extension'):
+            app.load_vllm_extension()
+
+    def test_missing_nested_dependency_does_not_fall_back(self):
+        error = ModuleNotFoundError('dependency absent',name='missing_dependency')
+        with patch.object(app.importlib,'import_module',side_effect=error) as load:
+            with self.assertRaises(ModuleNotFoundError) as result: app.load_vllm_extension()
+        self.assertIs(result.exception,error)
+        self.assertEqual(load.call_count,1)
+
+    def test_binary_linker_failure_is_preserved(self):
+        error = ImportError('libtorch_cuda.so: undefined symbol')
+        with patch.object(app.importlib,'import_module',side_effect=error) as load:
+            with self.assertRaises(ImportError) as result: app.load_vllm_extension()
+        self.assertIs(result.exception,error)
+        self.assertEqual(load.call_count,1)
+
+    def probe_modules(self):
+        class Version:
+            def __init__(self,value):
+                self.base_version = value.split('+')[0]
+                self.parts = tuple(map(int,self.base_version.split('.')))
+            def __lt__(self,other): return self.parts < other.parts
+        torch = Mock(__version__='2.13.0+cu130')
+        torch.version.cuda = '13.0'
+        torch.cuda.is_available.return_value = True
+        torch.cuda.get_device_capability.return_value = (12,0)
+        torch.cuda.mem_get_info.return_value = (31*app.GIB,32*app.GIB)
+        torch.cuda.get_device_name.return_value = 'NVIDIA GeForce RTX 5090'
+        torch.allclose.return_value = True
+        vllm = types.ModuleType('vllm'); vllm.__path__ = []
+        modules = {'torch':torch,'vllm':vllm,
+                   'transformers':types.SimpleNamespace(__version__='5.16.0'),
+                   'huggingface_hub':types.SimpleNamespace(__version__='1.0.0'),
+                   'packaging':types.ModuleType('packaging'),
+                   'packaging.version':types.SimpleNamespace(Version=Version)}
+        return modules,torch
+
+    def test_complete_probe_accepts_modern_only_wheel_and_runs_vllm_kernel(self):
+        modules,torch = self.probe_modules()
+        with patch.dict(sys.modules,modules),patch('importlib.metadata.version',return_value='0.31.0'),\
+             patch.object(app,'load_vllm_extension',return_value='vllm._C_stable_libtorch'),patch.object(app,'emit') as emit:
+            app.probe_worker('0.31.0')
+        result = emit.call_args.args[0]
+        self.assertTrue(result['ok'],result)
+        self.assertEqual(result['extension'],'vllm._C_stable_libtorch')
+        self.assertEqual(result['kernel_check'],'rms_norm')
+        torch.ops._C.rms_norm.assert_called_once()
+
+    def test_probe_rejects_vllm_kernel_runtime_failure(self):
+        modules,torch = self.probe_modules()
+        torch.ops._C.rms_norm.side_effect = RuntimeError('no kernel image available')
+        with patch.dict(sys.modules,modules),patch('importlib.metadata.version',return_value='0.31.0'),\
+             patch.object(app,'load_vllm_extension',return_value='vllm._C_stable_libtorch'),patch.object(app,'emit') as emit:
+            app.probe_worker('0.31.0')
+        result = emit.call_args.args[0]
+        self.assertFalse(result['ok'])
+        self.assertIn('no kernel image',result['error'])
+
+    def test_probe_rejects_incorrect_kernel_result(self):
+        modules,torch = self.probe_modules()
+        torch.allclose.return_value = False
+        with patch.dict(sys.modules,modules),patch('importlib.metadata.version',return_value='0.31.0'),\
+             patch.object(app,'load_vllm_extension',return_value='vllm._C_stable_libtorch'),patch.object(app,'emit') as emit:
+            app.probe_worker('0.31.0')
+        self.assertFalse(emit.call_args.args[0]['ok'])
+        self.assertIn('unexpected result',emit.call_args.args[0]['error'])
+
+
 class CacheTests(Base):
     def test_complete_snapshot_reused_without_network(self):
         record = {'model':self.config.model,'requested_revision':'main','commit':'a'*40,'snapshot':str(self.snapshot())}
