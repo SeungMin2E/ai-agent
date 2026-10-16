@@ -49,7 +49,7 @@ class ConfigurationTests(Base):
                  {'gpu_memory_utilization':float('nan')},{'gpu_memory_utilization':1.0},
                  {'host':'0.0.0.0'},{'host':'example.com'},{'model':'bad; command'},
                  {'revision':''},{'vllm_version':'latest'},{'retries':0},
-                 {'startup_timeout':-1},{'state_dir':str(self.root)})
+                 {'startup_timeout':-1},{'jit_timeout':0},{'max_jobs':0},{'state_dir':str(self.root)})
         for changes in cases:
             with self.subTest(changes=changes),self.assertRaises(app.SetupError):
                 replace(self.config,**changes).validate()
@@ -70,6 +70,13 @@ class ConfigurationTests(Base):
         self.assertEqual(parts[0],str(python.absolute().parent))
         self.assertIn(str(self.config.state/'tools-venv/bin'),parts)
         self.assertEqual(parts[-1],'original-system-path')
+
+    def test_build_parallelism_is_bounded_and_explicit_override_is_validated(self):
+        self.assertEqual(self.config.environment()['MAX_JOBS'],'1')
+        with patch.dict(os.environ,{'MAX_JOBS':'2','WORKSPACE':str(self.root)}):
+            self.assertEqual(app.Config.from_env().environment()['MAX_JOBS'],'2')
+        with patch.dict(os.environ,{'MAX_JOBS':'invalid'}),self.assertRaises(app.SetupError):
+            app.Config.from_env()
 
     def test_plan_needs_no_gpu(self):
         with patch.dict(os.environ,{'WORKSPACE':str(self.root),'STATE_DIR':str(self.root/'state')}):
@@ -143,6 +150,9 @@ class FailureHandlingTests(Base):
         self.assertIn('Port conflict',app.failure_hint('Port 8000 is occupied'))
         self.assertIn('ninja',app.failure_hint("FileNotFoundError: [Errno 2] No such file or directory: 'ninja'"))
         self.assertNotIn('MAX_MODEL_LEN',app.failure_hint("FileNotFoundError: No such file or directory: 'ninja'"))
+        killed = app.failure_hint('Ninja build failed. FAILED: [code=137] nvcc\nKilled')
+        self.assertIn('host/container RAM',killed)
+        self.assertNotIn('MAX_MODEL_LEN',killed)
 
     def test_readiness_requires_requested_model(self):
         cases = [({},False),([],False),({'data':None},False),({'data':[None]},False),
@@ -317,7 +327,7 @@ class CacheTests(Base):
         with patch.object(app,'probe',return_value=result),patch.object(app,'run_logged') as install:
             python,_ = app.choose_runtime(self.config)
         self.assertEqual(python,sys.executable)
-        install.assert_not_called()
+        self.assertEqual(install.call_args.args[0],[sys.executable,'-m','pip','check'])
 
     def test_wrong_hardware_does_not_trigger_reinstall(self):
         with patch.object(app,'probe',return_value={'ok':False,'hardware_error':True,'error':'wrong GPU'}),patch.object(app,'run_logged') as install:
@@ -418,7 +428,7 @@ class StartSafetyTests(Base):
     def test_build_tool_failure_does_not_launch_model_server(self):
         result = {'ok':True,'free_bytes':31*app.GIB,'total_bytes':32*app.GIB}
         with patch.object(app,'port_busy',return_value=False),patch.object(app,'probe',return_value=result),\
-             patch.object(app,'ensure_build_tools',side_effect=app.SetupError('Missing nvcc')),patch.object(app.subprocess,'Popen') as launch:
+             patch.object(app,'run_preflight',side_effect=app.SetupError('Missing nvcc')),patch.object(app.subprocess,'Popen') as launch:
             with self.assertRaisesRegex(app.SetupError,'Missing nvcc'):
                 app.start(self.config,'python',{'snapshot':'snapshot'})
         launch.assert_not_called()
@@ -432,6 +442,20 @@ class StartSafetyTests(Base):
         with patch.object(app,'same_process',return_value=False),patch.object(app.os,'killpg',create=True) as kill:
             app.stop(self.config)
         kill.assert_not_called()
+
+    def test_cleanup_failure_preserves_original_error_and_pid_state(self):
+        gpu = {'ok':True,'free_bytes':31*app.GIB,'total_bytes':32*app.GIB}
+        process = Mock(pid=123)
+        process.poll.return_value = 1
+        process.returncode = 1
+        identity = {'pid':123,'start_ticks':'test','boot_id':'test'}
+        with patch.object(app,'probe',return_value=gpu),patch.object(app,'port_busy',return_value=False),\
+             patch.object(app,'run_preflight'),patch.object(app,'process_identity',return_value=identity),\
+             patch.object(app.subprocess,'Popen',return_value=process),\
+             patch.object(app,'terminate_spawned',side_effect=OSError('cleanup failed')):
+            with self.assertRaisesRegex(app.SetupError,'Server exited \\(code 1\\)'):
+                app.start(self.config,sys.executable,{'snapshot':'unused'})
+        self.assertEqual(app.load_json(self.config.state/'server.json')['pid'],123)
 
 
 @unittest.skipUnless(sys.platform.startswith('linux'),'requires Linux process groups and /proc')
@@ -465,13 +489,16 @@ assert shutil.which('bootstrap_test_ninja'), 'runtime bin missing from child PAT
 class Handler(http.server.BaseHTTPRequestHandler):
  def do_GET(self):
   self.send_response(200);self.end_headers();self.wfile.write(json.dumps({"data":[{"id":sys.argv[2]}]}).encode())
+ def do_POST(self):
+  self.rfile.read(int(self.headers.get('Content-Length','0')))
+  self.send_response(200);self.end_headers();self.wfile.write(json.dumps({"choices":[{"message":{"content":"OK"}}]}).encode())
  def log_message(self,*args): pass
 http.server.HTTPServer(("127.0.0.1",int(sys.argv[1])),Handler).serve_forever()
 ''')
         config = replace(self.config,port=self.free_port(),startup_timeout=10)
         gpu = {'ok':True,'free_bytes':31*app.GIB,'total_bytes':32*app.GIB}
         self.addCleanup(app.stop,config)
-        with patch.object(app,'probe',return_value=gpu),patch.object(app,'ensure_build_tools'),patch.object(app,'build_server_command',return_value=[sys.executable,str(fake),str(config.port),config.model]):
+        with patch.object(app,'probe',return_value=gpu),patch.object(app,'run_preflight'),patch.object(app,'build_server_command',return_value=[sys.executable,str(fake),str(config.port),config.model]):
             app.start(config,str(runtime_python),{'snapshot':str(self.snapshot())})
             first = app.load_json(config.state/'server.json')
             self.assertTrue(app.ready(config))
@@ -484,10 +511,32 @@ http.server.HTTPServer(("127.0.0.1",int(sys.argv[1])),Handler).serve_forever()
     def test_failed_start_cleans_managed_process(self):
         config = replace(self.config,port=self.free_port(),startup_timeout=2)
         gpu = {'ok':True,'free_bytes':31*app.GIB,'total_bytes':32*app.GIB}
-        with patch.object(app,'probe',return_value=gpu),patch.object(app,'ensure_build_tools'),patch.object(app,'build_server_command',return_value=[sys.executable,'-c','raise SystemExit(3)']):
+        with patch.object(app,'probe',return_value=gpu),patch.object(app,'run_preflight'),patch.object(app,'build_server_command',return_value=[sys.executable,'-c','raise SystemExit(3)']):
             with self.assertRaises(app.SetupError): app.start(config,sys.executable,{'snapshot':'unused'})
         self.assertFalse((config.state/'server.json').exists())
         self.assertIn('exited with code 3',app.tail(config.state/'logs/server.log'))
+
+    def test_ready_endpoint_with_failed_inference_is_not_reported_as_success(self):
+        fake = self.root/'bad_inference.py'
+        fake.write_text('''import http.server,json,sys
+class Handler(http.server.BaseHTTPRequestHandler):
+ def do_GET(self):
+  self.send_response(200);self.end_headers();self.wfile.write(json.dumps({"data":[{"id":sys.argv[2]}]}).encode())
+ def do_POST(self):
+  self.rfile.read(int(self.headers.get('Content-Length','0')))
+  self.send_response(200);self.end_headers();self.wfile.write(json.dumps({"choices":[{"message":{"content":""}}]}).encode())
+ def log_message(self,*args): pass
+http.server.HTTPServer(("127.0.0.1",int(sys.argv[1])),Handler).serve_forever()
+''')
+        config = replace(self.config,port=self.free_port(),startup_timeout=10)
+        gpu = {'ok':True,'free_bytes':31*app.GIB,'total_bytes':32*app.GIB}
+        with patch.object(app,'probe',return_value=gpu),patch.object(app,'run_preflight'),\
+             patch.object(app,'build_server_command',return_value=[sys.executable,str(fake),str(config.port),config.model]):
+            with self.assertRaisesRegex(app.SetupError,'empty answer'):
+                app.start(config,sys.executable,{'snapshot':'unused'})
+        self.assertFalse(app.ready(config))
+        self.assertFalse((config.state/'server.json').exists())
+        self.assertIn('empty answer',app.load_json(config.state/'logs/startup-failure.json')['reason'])
 
     def test_timed_out_child_is_stopped(self):
         with self.assertRaisesRegex(app.SetupError,'timed out'):

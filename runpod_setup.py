@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 import ipaddress
 import importlib
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -110,6 +111,8 @@ class Config:
     startup_timeout: int = 900
     install_timeout: int = 3600
     download_timeout: int = 10800
+    jit_timeout: int = 1800
+    max_jobs: int = 1
     retries: int = 3
 
     @classmethod
@@ -122,7 +125,8 @@ class Config:
         names = {'model':'MODEL_ID', 'revision':'MODEL_REVISION', 'vllm_version':'VLLM_VERSION',
                  'host':'HOST', 'port':'PORT', 'max_model_len':'MAX_MODEL_LEN', 'max_num_seqs':'MAX_NUM_SEQS',
                  'gpu_memory_utilization':'GPU_MEMORY_UTILIZATION', 'startup_timeout':'STARTUP_TIMEOUT',
-                 'install_timeout':'INSTALL_TIMEOUT', 'download_timeout':'DOWNLOAD_TIMEOUT', 'retries':'RETRIES'}
+                 'install_timeout':'INSTALL_TIMEOUT', 'download_timeout':'DOWNLOAD_TIMEOUT',
+                 'jit_timeout':'JIT_TIMEOUT','max_jobs':'MAX_JOBS','retries':'RETRIES'}
         try:
             for field, name in names.items():
                 default = getattr(defaults, field)
@@ -151,7 +155,7 @@ class Config:
         if not 0 < self.gpu_memory_utilization < 1:
             raise SetupError('GPU_MEMORY_UTILIZATION must be greater than 0 and less than 1.')
         if min(self.max_model_len, self.max_num_seqs, self.startup_timeout,
-               self.install_timeout, self.download_timeout) <= 0:
+               self.install_timeout, self.download_timeout,self.jit_timeout,self.max_jobs) <= 0:
             raise SetupError('Lengths, concurrency and timeouts must be positive.')
         if not 1 <= self.retries <= 10:
             raise SetupError('RETRIES must be between 1 and 10.')
@@ -175,6 +179,7 @@ class Config:
         env.update(HF_HOME=self.hf_home, HF_HUB_CACHE=str(Path(self.hf_home)/'hub'),
                    VLLM_CACHE_ROOT=str(self.state/'vllm-cache'), PIP_CACHE_DIR=str(self.state/'pip-cache'),
                    TMPDIR=str(self.state/'tmp'), PYTHONUNBUFFERED='1')
+        env['MAX_JOBS'] = str(self.max_jobs)
         env.setdefault('CUDA_VISIBLE_DEVICES', '0')
         # Calling /venv/bin/python does not activate /venv/bin for child executables.
         # FlashInfer launches ninja/nvcc by name, so pass their search path explicitly.
@@ -309,6 +314,9 @@ def probe(python, config):
 def failure_hint(error):
     """Offer the relevant next step, instead of showing an OOM hint for all errors."""
     text = str(error).lower()
+    if ('ninja' in text or 'nvcc' in text) and any(word in text for word in ('code=137','exit status 137','killed','exit -9')):
+        return ('CUDA compiler was killed; host/container RAM pressure is likely. MAX_JOBS defaults to 1. '
+                'Inspect host memory and cgroup OOM counters in logs/preflight.json before changing GPU context length.')
     if 'ninja' in text and ('no such file' in text or 'missing' in text or 'not found' in text):
         return ('FlashInfer JIT build tool ninja is unavailable. Update this repository and run bash setup.sh; '
                 'setup installs ninja and supplies the runtime bin directory in PATH. Model caches are preserved.')
@@ -390,6 +398,11 @@ def choose_runtime(config):
         if result.get('hardware_error'):
             raise SetupError(result['error'])
         if result.get('ok'):
+            try:
+                run_logged([candidate,'-m','pip','check'],config,'pip-check',60)
+            except SetupError as exc:
+                say(f'Runtime dependency check failed: {candidate}: {exc}')
+                continue
             say(f'Reusing runtime: {candidate}; vLLM {result["vllm"]}; {result["gpu"]}.')
             save_json(config.state/'runtime.json',{'python':candidate,'probe':result})
             return candidate,result
@@ -433,7 +446,7 @@ def ensure_build_tools(config, python):
     env = config.environment(python)
     tools = {'ninja':shutil.which('ninja',path=env['PATH']),
              'cxx':shutil.which(env.get('CXX','c++'),path=env['PATH']),
-             'nvcc':shutil.which(env.get('CUDACXX','nvcc'),path=env['PATH'])}
+             'nvcc':shutil.which(env.get('FLASHINFER_NVCC','nvcc'),path=env['PATH'])}
     missing = [name for name,path in tools.items() if not path]
     if missing:
         raise SetupError('Missing FlashInfer JIT build tools: ' + ', '.join(missing) + '. '
@@ -459,9 +472,120 @@ def ensure_build_tools(config, python):
     return versions
 
 
-def complete_snapshot(path):
-    path = Path(path)
+def memory_status():
+    """Record host and container RAM separately from GPU memory."""
+    result = {}
     try:
+        for line in Path('/proc/meminfo').read_text().splitlines():
+            key,_,value = line.partition(':')
+            if key in ('MemTotal','MemAvailable'):
+                result[key+'_bytes'] = int(value.split()[0])*1024
+    except (OSError,ValueError):
+        pass
+    cgroup = Path('/sys/fs/cgroup')
+    for name in ('memory.max','memory.current','memory.peak'):
+        try:
+            value = (cgroup/name).read_text().strip()
+            result[name] = None if value == 'max' else int(value)
+        except (OSError,ValueError):
+            pass
+    try:
+        result['memory.events'] = {key:int(value) for key,value in
+                                   (line.split() for line in (cgroup/'memory.events').read_text().splitlines())}
+    except (OSError,ValueError):
+        pass
+    return result
+
+
+def nvfp4_worker():
+    """Build and run the actual CUTLASS NVFP4 path without loading a 27B model."""
+    stage = 'flashinfer_import'
+    try:
+        import importlib.metadata as metadata
+        import torch
+        from flashinfer import nvfp4_quantize,mm_fp4,SfLayout
+        stage = 'nvfp4_quantization'
+        inputs = torch.ones((128,128),device='cuda',dtype=torch.bfloat16)
+        scale = torch.tensor([448.0*6.0],device='cuda',dtype=torch.float32)
+        packed,scales = nvfp4_quantize(inputs,scale,sfLayout=SfLayout.layout_128x4,do_shuffle=False)
+        alpha = 1.0/(scale*scale)
+        stage = 'nvfp4_cutlass_build_and_run'
+        output = mm_fp4(packed,packed.T,scales,scales.T,alpha,
+                        out_dtype=torch.bfloat16,backend='cutlass')
+        torch.cuda.synchronize()
+        expected = torch.full((128,128),128.0,device='cuda',dtype=torch.bfloat16)
+        if output.shape != expected.shape or not torch.allclose(output,expected,rtol=0.05,atol=0.5):
+            raise RuntimeError('NVFP4 CUTLASS verification produced an incorrect result.')
+        emit({'ok':True,'stage':'complete','backend':'cutlass','shape':[128,128],
+              'flashinfer':metadata.version('flashinfer-python'),'max_jobs':os.environ.get('MAX_JOBS')})
+    except Exception as exc:
+        emit({'ok':False,'stage':stage,'error':redact(f'{type(exc).__name__}: {exc}')})
+        raise SystemExit(22)
+
+
+def run_preflight(config, python, *, check_dependencies=True):
+    record = {'before':memory_status(),'max_jobs':config.max_jobs,'python':str(python),
+              'checked_at':datetime.now().astimezone().isoformat(timespec='seconds')}
+    try:
+        if check_dependencies:
+            run_logged([python,'-m','pip','check'],config,'pip-check',60)
+        record['tools'] = ensure_build_tools(config,python)
+        say(f'NVFP4 preflight: compiling/running a small CUTLASS operation; MAX_JOBS={config.max_jobs}. No model weights loaded.')
+        output = run_logged([python,str(SCRIPT),'_nvfp4'],config,'nvfp4-preflight',config.jit_timeout)
+        record['kernel'] = extract_result(output)
+        if not isinstance(record['kernel'],dict) or not record['kernel'].get('ok'):
+            raise SetupError('NVFP4 kernel verification failed: '+str(record['kernel']))
+        record['ok'] = True
+    except (SetupError,OSError,subprocess.SubprocessError) as exc:
+        record.update(ok=False,error=redact(str(exc)))
+        raise SetupError(f'Preflight failed before model loading. Diagnostics: {config.state/"logs/preflight.json"}.\n{exc}') from exc
+    except KeyboardInterrupt:
+        record.update(ok=False,error='Interrupted; compilation child was stopped and caches were preserved.')
+        raise
+    finally:
+        record['after'] = memory_status()
+        save_json(config.state/'logs/preflight.json',record)
+    say('PREFLIGHT OK: dependencies, build tools and NVFP4 CUTLASS execution verified.')
+    return record
+
+
+def error_lines(path):
+    selected = []
+    for line in tail(path,1024*1024).splitlines():
+        if 'Engine core initialization failed' in line or 'EngineCore failed to start' in line:
+            continue
+        if re.search(r'\b\w*Error:|fatal error|FAILED:|\bKilled\b|ninja: build stopped',line):
+            clean = re.sub(r'^.*?\[core\.py:\d+\]\s*','',line).strip()
+            if clean not in selected:
+                selected.append(clean[:1200])
+    return selected[:12]+selected[-12:] if len(selected)>24 else selected
+
+
+def startup_error(config, reason, log_path):
+    causes = error_lines(log_path)
+    save_json(config.state/'logs/startup-failure.json',
+              {'reason':reason,'log':str(log_path),'errors':causes,'memory':memory_status(),
+               'at':datetime.now().astimezone().isoformat(timespec='seconds')})
+    return SetupError(f'{reason}. Full log: {log_path}\n{tail(log_path)}\n'
+                      'Detected cause lines:\n'+'\n'.join(causes))
+
+
+def diagnose(config):
+    result = {'config':asdict(config),'script_sha256':hashlib.sha256(SCRIPT.read_bytes()).hexdigest(),
+              'memory':memory_status()}
+    for name in ('runtime-check','build-tools','preflight','startup-failure'):
+        path = config.state/'logs'/f'{name}.json'
+        try:
+            result[name] = load_json(path,{'status':'not recorded'})
+        except SetupError as exc:
+            result[name] = {'error':redact(str(exc))}
+    result['server_errors'] = error_lines(config.state/'logs/server.log')
+    print(redact(json.dumps(result,indent=2)))
+
+
+def complete_snapshot(path):
+    try:
+        path = Path(path)
         for name in ('config.json','tokenizer_config.json','tokenizer.json'):
             if not (path/name).is_file() or (path/name).stat().st_size == 0:
                 return False
@@ -529,7 +653,7 @@ def process_identity(pid):
             return None
         return {'pid':int(pid),'start_ticks':fields[19],
                 'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
-    except (FileNotFoundError,ProcessLookupError,IndexError,ValueError):
+    except (FileNotFoundError,ProcessLookupError,IndexError,ValueError,TypeError):
         return None
 
 
@@ -587,7 +711,7 @@ def existing_server(config):
     return record
 
 
-def start(config, python, model):
+def start(config, python, model, *, preflight_done=False):
     if existing_server(config):
         if ready(config):
             say(f'Already running: {config.url}/v1'); return
@@ -600,7 +724,8 @@ def start(config, python, model):
     budget = result['total_bytes']*config.gpu_memory_utilization
     if result['free_bytes'] < budget:
         raise SetupError(f'GPU busy: {result["free_bytes"]/GIB:.1f} GiB free; requested budget {budget/GIB:.1f} GiB. Inspect nvidia-smi; unrelated processes were not killed.')
-    ensure_build_tools(config,python)
+    if not preflight_done:
+        run_preflight(config,python)
     save_json(config.state/'launch.json',{'command':build_server_command(config,python,model['snapshot'])})
     log_path = config.state/'logs/server.log'
     if log_path.exists():
@@ -611,24 +736,31 @@ def start(config, python, model):
     try:
         record = process_identity(process.pid)
         if not record:
-            raise SetupError(f'Server supervisor exited before initialization.\n{tail(log_path)}')
+            raise startup_error(config,'Server supervisor exited before initialization',log_path)
         record.update(config=asdict(config),cuda_visible_devices=config.environment()['CUDA_VISIBLE_DEVICES'])
         save_json(config.state/'server.json',record)
         deadline,next_update = time.monotonic()+config.startup_timeout,0
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                raise SetupError(f'Server exited (code {process.returncode}). Log: {log_path}\n{tail(log_path,64000)}')
+                raise startup_error(config,f'Server exited (code {process.returncode})',log_path)
             if ready(config):
+                smoke(config)
                 MANAGED_CHILDREN[process.pid] = process
                 say(f'READY: {config.url}/v1 ; model={config.model}'); return
             if time.monotonic() >= next_update:
                 say(f'Loading model. Log: {log_path}')
                 next_update = time.monotonic()+20
             time.sleep(2)
-        raise SetupError(f'Server startup timed out after {config.startup_timeout}s.\n{tail(log_path)}')
-    except BaseException:
-        terminate_spawned(process)
-        (config.state/'server.json').unlink(missing_ok=True)
+        raise startup_error(config,f'Server startup timed out after {config.startup_timeout}s',log_path)
+    except BaseException as exc:
+        try:
+            terminate_spawned(process)
+        except (OSError,subprocess.SubprocessError) as cleanup_error:
+            say(f'Cleanup could not complete: {cleanup_error}. PID state preserved for stop/status.')
+        else:
+            (config.state/'server.json').unlink(missing_ok=True)
+        if isinstance(exc,(SetupError,OSError,ValueError)) and 'Detected cause lines:' not in str(exc):
+            raise startup_error(config,f'Server startup/readiness failed: {redact(str(exc))}',log_path) from exc
         raise
 
 
@@ -701,7 +833,7 @@ def smoke(config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command',nargs='?',default='setup',choices=['setup','start','check','status','stop','logs','test','plan'])
+    parser.add_argument('command',nargs='?',default='setup',choices=['setup','start','preflight','diagnose','check','status','stop','logs','test','plan'])
     args = parser.parse_args(argv)
     config = Config.from_env()
     if args.command == 'plan':
@@ -714,6 +846,8 @@ def main(argv=None):
     ensure_layout(config)
     if args.command == 'logs':
         print(tail(config.state/'logs/server.log')); return 0
+    if args.command == 'diagnose':
+        diagnose(config); return 0
     if args.command == 'status':
         record = load_json(config.state/'server.json',{})
         running = same_process(record)
@@ -726,6 +860,8 @@ def main(argv=None):
     with lock(config.state/'setup.lock'):
         if args.command == 'stop':
             stop(config); return 0
+        if args.command == 'preflight' and existing_server(config):
+            raise SetupError('Stop the managed model server before running preflight to avoid concurrent GPU work.')
         if args.command in ('setup','start') and existing_server(config):
             if ready(config):
                 say(f'Already running: {config.url}/v1'); return 0
@@ -752,8 +888,10 @@ def main(argv=None):
         else:
             python,result = choose_runtime(config)
             say(f'CUDA verified: PyTorch {result["torch"]}, CUDA {result["cuda"]}.')
-            ensure_build_tools(config,python)
-            start(config,python,download(config,python))
+            run_preflight(config,python,check_dependencies=False)
+            if args.command == 'preflight':
+                return 0
+            start(config,python,download(config,python),preflight_done=True)
     return 0
 
 
@@ -762,6 +900,8 @@ def entrypoint():
         probe_worker(sys.argv[2]); return 0
     if len(sys.argv)>1 and sys.argv[1]=='_download':
         download_worker(*sys.argv[2:5]); return 0
+    if len(sys.argv)>1 and sys.argv[1]=='_nvfp4':
+        nvfp4_worker(); return 0
     if len(sys.argv)>1 and sys.argv[1]=='_serve':
         serve_worker(sys.argv[2]); return 0
     def interrupted(_signal,_frame):

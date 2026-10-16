@@ -1,7 +1,7 @@
 # RunPod Qwen 자동 설정
 
 RTX 5090 한 장에서 `Inferact/Qwen3.8-27B-NVFP4`를 vLLM으로 실행합니다.
-환경 검사 → 호환 런타임 재사용 또는 별도 설치 → 모델 다운로드 → 백그라운드 실행 → 준비 확인을 자동 처리합니다.
+환경 검사 → 호환 런타임 확보 → NVFP4 커널 사전 검사 → 모델 다운로드 → 백그라운드 실행 → 실제 짧은 추론까지 자동 처리합니다.
 
 ## 개발 PC의 GitHub 자동 업로드
 
@@ -24,8 +24,8 @@ bash setup.sh
 이미 받았다면 `cd /workspace/ai-agent` 후 `bash setup.sh`만 실행합니다.
 `git`이 없는 이미지에서는 Code → Download ZIP으로 받은 파일을 `/workspace/ai-agent`에 풀어도 됩니다.
 
-완료되면 `READY: http://127.0.0.1:8000/v1`이 표시됩니다. `/v1/models` 응답에 요청한 모델 이름이 포함돼야 준비 완료로 판단합니다.
-실제 추론은 다음으로 확인합니다.
+완료되면 `READY: http://127.0.0.1:8000/v1`이 표시됩니다. `/v1/models`에서 요청 모델을 확인하고 짧은 실제 답변 생성까지 성공해야 준비 완료로 판단합니다.
+이후 실제 추론을 다시 확인하려면 다음을 실행합니다.
 
 ```bash
 bash setup.sh test
@@ -41,6 +41,8 @@ Pod 재시작 후 자동 부팅되지는 않으므로 `bash setup.sh start`를 �
 | `bash setup.sh` | 전체 설정·실행. 같은 설정의 관리 서버가 있으면 중복 실행하지 않음 |
 | `bash setup.sh check` | GPU·CUDA·vLLM 검사. 패키지 설치·모델 다운로드 없음 |
 | `bash setup.sh start` | 저장된 런타임·모델로 실행 |
+| `bash setup.sh preflight` | 런타임 확보·빌드 도구 검사·실제 NVFP4 CUTLASS 연산. 모델 다운로드·로딩·서버 실행 없음 |
+| `bash setup.sh diagnose` | 버전·빌드 도구·호스트 RAM·컨테이너 RAM 제한·OOM 카운터·원인 로그를 모아서 출력. 패키지 설치·GPU 작업 없음 |
 | `bash setup.sh status` | 프로세스와 요청한 모델의 준비 상태 확인 |
 | `bash setup.sh logs` | 최근 서버 로그 |
 | `bash setup.sh test` | 짧은 실제 추론 요청 |
@@ -64,6 +66,8 @@ Pod 재시작 후 자동 부팅되지는 않으므로 `bash setup.sh start`를 �
 | 상태·런타임·로그 | `/workspace/ai-agent-state` |
 | 준비 제한 | 900초 |
 | 설치 / 다운로드 제한 | 시도당 3,600초 / 10,800초 |
+| NVFP4 사전 검사 제한 | 1,800초 |
+| JIT 빌드 동시 작업 | `MAX_JOBS=1` — 호스트 RAM 사용 억제 |
 | 일시 오류 재시도 | 최대 3회 |
 
 환경변수로 바꿉니다. 이후 관리 명령에도 같은 값을 적용하세요.
@@ -75,7 +79,7 @@ bash setup.sh
 ```
 
 지원 변수: `WORKSPACE`, `STATE_DIR`, `HF_HOME`, `MODEL_ID`, `MODEL_REVISION`, `VLLM_VERSION`, `HOST`, `PORT`,
-`MAX_MODEL_LEN`, `MAX_NUM_SEQS`, `GPU_MEMORY_UTILIZATION`, `STARTUP_TIMEOUT`, `INSTALL_TIMEOUT`, `DOWNLOAD_TIMEOUT`, `RETRIES`.
+`MAX_MODEL_LEN`, `MAX_NUM_SEQS`, `GPU_MEMORY_UTILIZATION`, `STARTUP_TIMEOUT`, `INSTALL_TIMEOUT`, `DOWNLOAD_TIMEOUT`, `JIT_TIMEOUT`, `MAX_JOBS`, `RETRIES`.
 `HOST`는 localhost 주소만 허용합니다. `CUDA_VISIBLE_DEVICES`는 지정값을 유지하고, 없으면 GPU 0을 사용합니다.
 32GB급 Blackwell GPU·단일 GPU용 프로필이며, 다른 모델은 메모리·아키텍처 호환성을 별도로 검토해야 합니다.
 
@@ -89,6 +93,9 @@ bash setup.sh
 - 실패한 검사 단계와 확인된 Python·vLLM·PyTorch·CUDA 버전은 `STATE_DIR/logs/runtime-check.json`에 기록합니다. 확장 모듈 오류, 라이브러리 불일치, GPU 메모리 부족, 디스크 부족, 포트 충돌은 원인별 조치 안내를 출력합니다.
 - FlashInfer의 NVFP4 JIT 빌드에 필요한 `ninja`를 설치하고 실행 환경의 `PATH`에 선택한 Python 런타임의 `bin` 경로를 포함합니다. 기존 런타임을 재사용할 때도 누락된 Ninja를 보완합니다. 별도 시스템 런타임을 재사용하는 경우에는 작은 도구용 가상환경에 설치하여 시스템 패키지를 변경하지 않습니다.
 - 모델 다운로드·로딩 전에 Ninja, C++ 컴파일러, `nvcc` 실행을 확인하고 `STATE_DIR/logs/build-tools.json`에 기록합니다. C++ 컴파일러와 CUDA Toolkit이 빠진 이미지라면 개발 도구가 포함된 CUDA 이미지가 필요하다는 안내로 중단합니다.
+- 모델 다운로드·로딩 전에 FlashInfer의 실제 NVFP4 양자화 및 CUTLASS 행렬 연산을 128×128 입력으로 검사합니다. 작은 연산도 최초에는 필요한 CUDA 모듈을 컴파일하므로 시간이 걸립니다. 기존 FlashInfer 빌드 캐시는 삭제하지 않습니다.
+- 컴파일 동시 작업을 기본 1개로 제한합니다. 사전 검사 전후의 호스트 RAM 및 cgroup 메모리·OOM 카운터와 결과를 `STATE_DIR/logs/preflight.json`에 기록합니다. `code=137`·`Killed`는 시스템 RAM 관련 가능성을 별도로 안내하며 GPU 문맥 길이 조절로 일괄 안내하지 않습니다.
+- 재사용하는 런타임에도 `pip check`를 실행하여 의존성 불일치를 확인합니다. 서버 기동에 실패하면 마지막 요약 오류와 함께 앞쪽 원인 줄을 추출해 `STATE_DIR/logs/startup-failure.json`에 보존합니다.
 - 호환되는 기존 환경 재사용. 새 설치는 별도 가상환경에서 수행하여 시스템 PyTorch를 덮어쓰지 않음.
 - 별도 런타임 설치 전 20GiB 여유 확인. 모델 다운로드 전 파일 크기·캐시를 대조하여 미다운로드 용량 + 3GiB 확인.
 - 네트워크 시간 초과 등 일시 오류만 제한 재시도. 401·403·404와 디스크 부족 등은 즉시 보고.
@@ -107,6 +114,7 @@ Linux에서는 새 상태 파일·로그를 현재 사용자만 읽도록 생성
 | --- | --- |
 | `No module named 'vllm._C'` (예전 설치 스크립트) | 저장소에서 `git pull --ff-only` 후 `bash setup.sh` 재실행. vLLM 0.31의 확장 이름 변경을 반영한 검사 사용 |
 | `No such file or directory: 'ninja'` | 저장소에서 `git pull --ff-only` 후 `bash setup.sh` 재실행. Ninja 설치 및 런타임 PATH 보완을 자동 처리 |
+| Ninja 빌드 중 `code=137` / `Killed` | CUDA 컴파일러 강제 종료. `MAX_JOBS=1` 유지 후 `bash setup.sh preflight`로 먼저 확인. `diagnose`의 RAM 제한·OOM 카운터 대조 |
 | 포트 사용 중 | 기존 vLLM 확인 또는 다른 `PORT` 사용 |
 | GPU 메모리 부족 | `nvidia-smi` 확인. 다른 작업 정리 후 `MAX_MODEL_LEN=4096`부터 재시도 |
 | venv 생성 실패 | venv/ensurepip가 포함된 Python 3.12 GPU 이미지 사용. Ubuntu는 필요 시 `python3-venv` 설치 |
@@ -136,7 +144,8 @@ bash -n setup.sh
 
 외부 다운로드·유료 GPU 없이 설정 오류, 재시도, 캐시·상태 손상, 포트 충돌, PID 재사용 방지를 검사합니다.
 Linux에서는 가짜 HTTP 서버로 실행·중복 방지·종료·준비 실패·시간 초과 정리를 확인합니다.
-GPU에서 실제 모델 다운로드·기동·추론은 `bash setup.sh`와 `bash setup.sh test`로 확인해야 합니다.
+NVFP4 검사 실패 시 모델 다운로드·로딩을 시작하지 않는 순서, 잘못된 연산 결과 거부, CPU RAM 관련 빌드 실패, 원인 로그 보존과 인증정보 마스킹도 검사합니다.
+단위 테스트와 CI는 GPU 연산을 대신 실행하지 않습니다. 실제 GPU에서 먼저 `bash setup.sh preflight`를 실행하여 CUDA 빌드·NVFP4 연산을 확인하고, 통과 후 `bash setup.sh`로 모델 기동·답변 생성까지 확인합니다.
 
 ## 근거
 
@@ -144,3 +153,4 @@ GPU에서 실제 모델 다운로드·기동·추론은 `bash setup.sh`와 `bash
 - [Qwen3.8-27B vLLM recipe: 단일 RTX 5090](https://recipes.vllm.ai/Qwen/Qwen3.8-27B)
 - [Inferact 모델 파일](https://huggingface.co/Inferact/Qwen3.8-27B-NVFP4/tree/main)
 - [RunPod 저장소 수명](https://docs.runpod.io/pods/storage/types)
+- [FlashInfer NVFP4 GEMM API](https://docs.flashinfer.ai/generated/flashinfer.gemm.mm_fp4.html)
