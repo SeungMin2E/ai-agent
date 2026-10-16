@@ -62,6 +62,15 @@ class ConfigurationTests(Base):
         with patch.dict(os.environ,{'CUDA_VISIBLE_DEVICES':'GPU-uuid-123'}):
             self.assertEqual(self.config.environment()['CUDA_VISIBLE_DEVICES'],'GPU-uuid-123')
 
+    def test_child_path_contains_selected_runtime_and_preserves_system_path(self):
+        python = self.config.state/'venv/bin/python'
+        with patch.dict(os.environ,{'PATH':'original-system-path'}):
+            env = self.config.environment(python)
+        parts = env['PATH'].split(os.pathsep)
+        self.assertEqual(parts[0],str(python.absolute().parent))
+        self.assertIn(str(self.config.state/'tools-venv/bin'),parts)
+        self.assertEqual(parts[-1],'original-system-path')
+
     def test_plan_needs_no_gpu(self):
         with patch.dict(os.environ,{'WORKSPACE':str(self.root),'STATE_DIR':str(self.root/'state')}):
             self.assertEqual(app.main(['plan']),0)
@@ -132,6 +141,8 @@ class FailureHandlingTests(Base):
         self.assertIn('Disk space',app.failure_hint('Not enough space for model'))
         self.assertIn('shared-library',app.failure_hint('libtorch_cuda.so: undefined symbol'))
         self.assertIn('Port conflict',app.failure_hint('Port 8000 is occupied'))
+        self.assertIn('ninja',app.failure_hint("FileNotFoundError: [Errno 2] No such file or directory: 'ninja'"))
+        self.assertNotIn('MAX_MODEL_LEN',app.failure_hint("FileNotFoundError: No such file or directory: 'ninja'"))
 
     def test_readiness_requires_requested_model(self):
         cases = [({},False),([],False),({'data':None},False),({'data':[None]},False),
@@ -314,6 +325,81 @@ class CacheTests(Base):
         install.assert_not_called()
 
 
+class BuildToolsTests(Base):
+    def available(self,name,**kwargs):
+        return '/build-tools/'+name
+
+    def version(self,args,**kwargs):
+        output = 'Cuda compilation tools, release 13.2, V13.2.86' if args[0].endswith('nvcc') else '1.13.0'
+        return types.SimpleNamespace(returncode=0,stdout=output,stderr='')
+
+    def test_existing_tools_are_verified_without_installing(self):
+        with patch.object(app.shutil,'which',side_effect=self.available),\
+             patch.object(app.subprocess,'run',side_effect=self.version),patch.object(app,'run_logged') as install:
+            result = app.ensure_build_tools(self.config,'/runtime/bin/python')
+        self.assertEqual(set(result),{'ninja','cxx','nvcc'})
+        install.assert_not_called()
+        self.assertEqual(app.load_json(self.config.state/'logs/build-tools.json'),result)
+
+    def test_missing_ninja_in_managed_runtime_repairs_only_ninja(self):
+        installed = False
+        def which(name,**kwargs):
+            return None if name == 'ninja' and not installed else self.available(name)
+        def install(*args,**kwargs):
+            nonlocal installed
+            installed = True
+        python = self.config.state/'venv/bin/python'
+        with patch.object(app.shutil,'which',side_effect=which),patch.object(app,'run_logged',side_effect=install) as run,\
+             patch.object(app.subprocess,'run',side_effect=self.version):
+            app.ensure_build_tools(self.config,str(python))
+        self.assertEqual(run.call_count,1)
+        command = run.call_args.args[0]
+        self.assertEqual(command[0],str(python))
+        self.assertIn('ninja>=1.11,<2',command)
+        self.assertFalse(any(str(x).startswith(('torch','vllm')) for x in command))
+
+    def test_system_runtime_uses_separate_tools_environment(self):
+        available = False
+        def which(name,**kwargs):
+            return None if name == 'ninja' and not available else self.available(name)
+        def install(*args,**kwargs):
+            nonlocal available
+            if 'pip' in args[0]: available = True
+        with patch.object(app.shutil,'which',side_effect=which),patch.object(app,'run_logged',side_effect=install) as run,\
+             patch.object(app.subprocess,'run',side_effect=self.version):
+            app.ensure_build_tools(self.config,sys.executable)
+        self.assertEqual(run.call_count,2)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn('venv',commands[0])
+        self.assertEqual(commands[1][0],str(self.config.state/'tools-venv/bin/python'))
+
+    def test_missing_compiler_fails_before_model_loading(self):
+        def which(name,**kwargs):
+            return None if name == 'nvcc' else self.available(name)
+        with patch.object(app.shutil,'which',side_effect=which),patch.object(app.subprocess,'run') as version:
+            with self.assertRaisesRegex(app.SetupError,'Missing FlashInfer.*nvcc'):
+                app.ensure_build_tools(self.config,sys.executable)
+        version.assert_not_called()
+
+    def test_broken_ninja_version_check_is_not_silently_accepted(self):
+        failed = types.SimpleNamespace(returncode=1,stdout='',stderr='broken tool')
+        with patch.object(app.shutil,'which',side_effect=self.available),patch.object(app.subprocess,'run',return_value=failed):
+            with self.assertRaisesRegex(app.SetupError,'ninja failed'):
+                app.ensure_build_tools(self.config,sys.executable)
+
+    def test_ninja_installation_failure_stops_setup(self):
+        with patch.object(app.shutil,'which',return_value=None),\
+             patch.object(app,'run_logged',side_effect=app.SetupError('install failed')):
+            with self.assertRaisesRegex(app.SetupError,'install failed'):
+                app.ensure_build_tools(self.config,str(self.config.state/'venv/bin/python'))
+
+    def test_old_cuda_toolkit_is_rejected_before_jit(self):
+        old = types.SimpleNamespace(returncode=0,stdout='release 12.4, V12.4.1',stderr='')
+        with patch.object(app.shutil,'which',side_effect=self.available),patch.object(app.subprocess,'run',return_value=old):
+            with self.assertRaisesRegex(app.SetupError,'CUDA Toolkit 12.8'):
+                app.ensure_build_tools(self.config,sys.executable)
+
+
 class StartSafetyTests(Base):
     def test_port_conflict_does_not_launch(self):
         with socket.socket() as occupied:
@@ -327,6 +413,14 @@ class StartSafetyTests(Base):
         result = {'ok':True,'free_bytes':2*app.GIB,'total_bytes':32*app.GIB}
         with patch.object(app,'port_busy',return_value=False),patch.object(app,'probe',return_value=result),patch.object(app.subprocess,'Popen') as launch:
             with self.assertRaisesRegex(app.SetupError,'GPU busy'): app.start(self.config,'python',{'snapshot':'snapshot'})
+        launch.assert_not_called()
+
+    def test_build_tool_failure_does_not_launch_model_server(self):
+        result = {'ok':True,'free_bytes':31*app.GIB,'total_bytes':32*app.GIB}
+        with patch.object(app,'port_busy',return_value=False),patch.object(app,'probe',return_value=result),\
+             patch.object(app,'ensure_build_tools',side_effect=app.SetupError('Missing nvcc')),patch.object(app.subprocess,'Popen') as launch:
+            with self.assertRaisesRegex(app.SetupError,'Missing nvcc'):
+                app.start(self.config,'python',{'snapshot':'snapshot'})
         launch.assert_not_called()
 
     def test_pid_reuse_is_not_considered_managed(self):
@@ -357,8 +451,17 @@ class LinuxIntegrationTests(Base):
             with app.lock(self.config.state/'setup.lock'): pass
 
     def test_supervised_start_duplicate_and_stop(self):
+        # Reproduce the lost-venv-PATH failure using a child-only executable.
+        tools = self.root/'runtime/bin'
+        tools.mkdir(parents=True)
+        runtime_python = tools/'python'
+        runtime_python.symlink_to(sys.executable)
+        marker = tools/'bootstrap_test_ninja'
+        marker.write_text('#!/bin/sh\nexit 0\n')
+        marker.chmod(0o755)
         fake = self.root/'fake_server.py'
-        fake.write_text('''import http.server,json,sys
+        fake.write_text('''import http.server,json,sys,shutil
+assert shutil.which('bootstrap_test_ninja'), 'runtime bin missing from child PATH'
 class Handler(http.server.BaseHTTPRequestHandler):
  def do_GET(self):
   self.send_response(200);self.end_headers();self.wfile.write(json.dumps({"data":[{"id":sys.argv[2]}]}).encode())
@@ -368,11 +471,11 @@ http.server.HTTPServer(("127.0.0.1",int(sys.argv[1])),Handler).serve_forever()
         config = replace(self.config,port=self.free_port(),startup_timeout=10)
         gpu = {'ok':True,'free_bytes':31*app.GIB,'total_bytes':32*app.GIB}
         self.addCleanup(app.stop,config)
-        with patch.object(app,'probe',return_value=gpu),patch.object(app,'build_server_command',return_value=[sys.executable,str(fake),str(config.port),config.model]):
-            app.start(config,sys.executable,{'snapshot':str(self.snapshot())})
+        with patch.object(app,'probe',return_value=gpu),patch.object(app,'ensure_build_tools'),patch.object(app,'build_server_command',return_value=[sys.executable,str(fake),str(config.port),config.model]):
+            app.start(config,str(runtime_python),{'snapshot':str(self.snapshot())})
             first = app.load_json(config.state/'server.json')
             self.assertTrue(app.ready(config))
-            app.start(config,sys.executable,{'snapshot':'unused'})
+            app.start(config,str(runtime_python),{'snapshot':'unused'})
             self.assertEqual(app.load_json(config.state/'server.json')['pid'],first['pid'])
         app.stop(config)
         self.assertFalse(app.same_process(first))
@@ -381,7 +484,7 @@ http.server.HTTPServer(("127.0.0.1",int(sys.argv[1])),Handler).serve_forever()
     def test_failed_start_cleans_managed_process(self):
         config = replace(self.config,port=self.free_port(),startup_timeout=2)
         gpu = {'ok':True,'free_bytes':31*app.GIB,'total_bytes':32*app.GIB}
-        with patch.object(app,'probe',return_value=gpu),patch.object(app,'build_server_command',return_value=[sys.executable,'-c','raise SystemExit(3)']):
+        with patch.object(app,'probe',return_value=gpu),patch.object(app,'ensure_build_tools'),patch.object(app,'build_server_command',return_value=[sys.executable,'-c','raise SystemExit(3)']):
             with self.assertRaises(app.SetupError): app.start(config,sys.executable,{'snapshot':'unused'})
         self.assertFalse((config.state/'server.json').exists())
         self.assertIn('exited with code 3',app.tail(config.state/'logs/server.log'))

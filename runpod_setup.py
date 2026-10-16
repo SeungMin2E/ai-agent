@@ -448,6 +448,11 @@ def ensure_build_tools(config, python):
             raise SetupError(f'FlashInfer build tool {name} could not run: {exc}') from exc
         if result.returncode:
             raise SetupError(f'FlashInfer build tool {name} failed its version check (exit {result.returncode}).')
+        if name == 'nvcc':
+            release = re.search(r'release\s+(\d+)\.(\d+)',result.stdout+result.stderr)
+            if release and tuple(map(int,release.groups())) < (12,8):
+                raise SetupError('FlashInfer on Blackwell requires CUDA Toolkit 12.8+; '
+                                 f'nvcc reports {release.group(0)}. Use a compatible CUDA development image.')
         versions[name] = {'path':path,'version':redact((result.stdout+result.stderr).strip()[:1200])}
     save_json(config.state/'logs/build-tools.json',versions)
     say('FlashInfer JIT tools verified: ninja, C++ compiler, nvcc.')
