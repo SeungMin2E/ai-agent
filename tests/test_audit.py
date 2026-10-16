@@ -40,7 +40,11 @@ class Nvfp4WorkerTests(Base):
         flashinfer.SfLayout = types.SimpleNamespace(layout_128x4='128x4')
         flashinfer.nvfp4_quantize = Mock(return_value=(tensor,tensor))
         flashinfer.mm_fp4 = Mock(return_value=tensor)
-        return {'torch':torch,'flashinfer':flashinfer},torch,flashinfer
+        sampling = types.ModuleType('flashinfer.sampling')
+        sampled = Mock(shape=(1,))
+        sampled.item.return_value = 1
+        sampling.sampling_from_probs = Mock(return_value=sampled)
+        return {'torch':torch,'flashinfer':flashinfer,'flashinfer.sampling':sampling},torch,flashinfer
 
     def test_nvfp4_uses_actual_cutlass_path_and_checks_result(self):
         modules,torch,flashinfer = self.modules()
@@ -51,8 +55,10 @@ class Nvfp4WorkerTests(Base):
         self.assertEqual(result['backend'],'cutlass')
         self.assertEqual(flashinfer.mm_fp4.call_args.kwargs['backend'],'cutlass')
         self.assertFalse(flashinfer.nvfp4_quantize.call_args.kwargs['do_shuffle'])
-        torch.cuda.synchronize.assert_called_once()
+        self.assertEqual(torch.cuda.synchronize.call_count,2)
         torch.allclose.assert_called_once()
+        self.assertTrue(result['sampling_verified'])
+        modules['flashinfer.sampling'].sampling_from_probs.assert_called_once()
 
     def test_compiler_killed_137_is_reported_at_nvfp4_stage(self):
         modules,torch,flashinfer = self.modules()
@@ -71,6 +77,21 @@ class Nvfp4WorkerTests(Base):
         with patch.dict(sys.modules,modules),patch.object(app,'emit') as emit,self.assertRaises(SystemExit):
             app.nvfp4_worker()
         self.assertIn('incorrect result',emit.call_args.args[0]['error'])
+
+    def test_sampling_compile_failure_is_detected_before_model_loading(self):
+        modules,_,_ = self.modules()
+        modules['flashinfer.sampling'].sampling_from_probs.side_effect = RuntimeError('sampling Ninja build failed')
+        with patch.dict(sys.modules,modules),patch.object(app,'emit') as emit,self.assertRaises(SystemExit):
+            app.nvfp4_worker()
+        self.assertEqual(emit.call_args.args[0]['stage'],'sampling_build_and_run')
+        self.assertFalse(emit.call_args.args[0]['ok'])
+
+    def test_wrong_sampling_result_cannot_pass_preflight(self):
+        modules,_,_ = self.modules()
+        modules['flashinfer.sampling'].sampling_from_probs.return_value.item.return_value = 0
+        with patch.dict(sys.modules,modules),patch.object(app,'emit') as emit,self.assertRaises(SystemExit):
+            app.nvfp4_worker()
+        self.assertIn('sampling verification',emit.call_args.args[0]['error'])
 
 
 class PreflightTests(Base):
@@ -202,6 +223,43 @@ class DiagnosticsTests(Base):
     def test_malformed_snapshot_or_pid_is_handled_without_type_error(self):
         self.assertFalse(app.complete_snapshot(None))
         self.assertIsNone(app.process_identity(None))
+
+
+class WarmupTests(Base):
+    def test_cold_request_uses_saved_warmup_timeout_instead_of_120_seconds(self):
+        config = replace(self.config,warmup_timeout=1800)
+        app.save_json(config.state/'server.json',{'config':app.asdict(config)})
+        with patch.object(sys,'argv',['runpod_setup.py','_smoke',str(config.state)]),\
+             patch.object(app,'smoke') as smoke:
+            self.assertEqual(app.entrypoint(),0)
+        self.assertEqual(smoke.call_args.kwargs['timeout'],1800)
+
+    def test_regular_test_keeps_short_timeout(self):
+        response = {'choices':[{'message':{'content':'OK'}}]}
+        with patch.object(app,'ready',return_value=True),patch.object(app,'request_json',return_value=response) as request:
+            app.smoke(self.config)
+        self.assertEqual(request.call_args.kwargs['timeout'],120)
+
+    def test_warmup_uses_supervised_progress_worker_with_bounded_deadline(self):
+        config = replace(self.config,warmup_timeout=240)
+        with patch.object(app,'run_logged') as run:
+            app.warmup(config,'runtime-python')
+        self.assertEqual(run.call_args.args[0],['runtime-python',str(app.SCRIPT),'_smoke',str(config.state)])
+        self.assertEqual(run.call_args.args[2:4],('warmup',250))
+
+    def test_failed_warmup_is_not_swallowed(self):
+        with patch.object(app,'run_logged',side_effect=app.SetupError('warmup timed out')):
+            with self.assertRaisesRegex(app.SetupError,'warmup timed out'):
+                app.warmup(self.config,'python')
+
+    def test_warmup_timeout_configuration_rejects_invalid_values(self):
+        paths = {'WORKSPACE':str(self.root),'STATE_DIR':str(self.config.state),'HF_HOME':self.config.hf_home}
+        with patch.dict(os.environ,dict(paths,WARMUP_TIMEOUT='600')):
+            self.assertEqual(app.Config.from_env().warmup_timeout,600)
+        for value in ('0','-1','invalid'):
+            with self.subTest(value=value),patch.dict(os.environ,dict(paths,WARMUP_TIMEOUT=value)):
+                with self.assertRaises(app.SetupError):
+                    app.Config.from_env()
 
 
 if __name__=='__main__':

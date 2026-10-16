@@ -109,6 +109,7 @@ class Config:
     max_num_seqs: int = 1
     gpu_memory_utilization: float = 0.90
     startup_timeout: int = 900
+    warmup_timeout: int = 1800
     install_timeout: int = 3600
     download_timeout: int = 10800
     jit_timeout: int = 1800
@@ -125,6 +126,7 @@ class Config:
         names = {'model':'MODEL_ID', 'revision':'MODEL_REVISION', 'vllm_version':'VLLM_VERSION',
                  'host':'HOST', 'port':'PORT', 'max_model_len':'MAX_MODEL_LEN', 'max_num_seqs':'MAX_NUM_SEQS',
                  'gpu_memory_utilization':'GPU_MEMORY_UTILIZATION', 'startup_timeout':'STARTUP_TIMEOUT',
+                 'warmup_timeout':'WARMUP_TIMEOUT',
                  'install_timeout':'INSTALL_TIMEOUT', 'download_timeout':'DOWNLOAD_TIMEOUT',
                  'jit_timeout':'JIT_TIMEOUT','max_jobs':'MAX_JOBS','retries':'RETRIES'}
         try:
@@ -154,7 +156,7 @@ class Config:
             raise SetupError('PORT must be between 1 and 65535.')
         if not 0 < self.gpu_memory_utilization < 1:
             raise SetupError('GPU_MEMORY_UTILIZATION must be greater than 0 and less than 1.')
-        if min(self.max_model_len, self.max_num_seqs, self.startup_timeout,
+        if min(self.max_model_len, self.max_num_seqs, self.startup_timeout,self.warmup_timeout,
                self.install_timeout, self.download_timeout,self.jit_timeout,self.max_jobs) <= 0:
             raise SetupError('Lengths, concurrency and timeouts must be positive.')
         if not 1 <= self.retries <= 10:
@@ -314,6 +316,9 @@ def probe(python, config):
 def failure_hint(error):
     """Offer the relevant next step, instead of showing an OOM hint for all errors."""
     text = str(error).lower()
+    if 'warmup' in text and ('timed out' in text or 'timeout' in text):
+        return ('First inference timed out. Inspect logs/warmup.log and logs/server.log for cold CUDA compilation '
+                'or an engine error. Sampling is included in preflight; WARMUP_TIMEOUT controls this separate deadline.')
     if ('ninja' in text or 'nvcc' in text) and any(word in text for word in ('code=137','exit status 137','killed','exit -9')):
         return ('CUDA compiler was killed; host/container RAM pressure is likely. MAX_JOBS defaults to 1. '
                 'Inspect host memory and cgroup OOM counters in logs/preflight.json before changing GPU context length.')
@@ -516,7 +521,17 @@ def nvfp4_worker():
         expected = torch.full((128,128),128.0,device='cuda',dtype=torch.bfloat16)
         if output.shape != expected.shape or not torch.allclose(output,expected,rtol=0.05,atol=0.5):
             raise RuntimeError('NVFP4 CUTLASS verification produced an incorrect result.')
+        # Sampling is loaded lazily on the first generated token, after model loading.
+        # Compile and run it here while model weights are absent from host/GPU RAM.
+        stage = 'sampling_build_and_run'
+        from flashinfer.sampling import sampling_from_probs
+        probabilities = torch.tensor([[0.0,1.0,0.0,0.0]],device='cuda',dtype=torch.float32)
+        sample = sampling_from_probs(probabilities,check_nan=True)
+        torch.cuda.synchronize()
+        if tuple(sample.shape) != (1,) or int(sample.item()) != 1:
+            raise RuntimeError('FlashInfer sampling verification produced an incorrect result.')
         emit({'ok':True,'stage':'complete','backend':'cutlass','shape':[128,128],
+              'sampling_verified':True,
               'flashinfer':metadata.version('flashinfer-python'),'max_jobs':os.environ.get('MAX_JOBS')})
     except Exception as exc:
         emit({'ok':False,'stage':stage,'error':redact(f'{type(exc).__name__}: {exc}')})
@@ -530,7 +545,7 @@ def run_preflight(config, python, *, check_dependencies=True):
         if check_dependencies:
             run_logged([python,'-m','pip','check'],config,'pip-check',60)
         record['tools'] = ensure_build_tools(config,python)
-        say(f'NVFP4 preflight: compiling/running a small CUTLASS operation; MAX_JOBS={config.max_jobs}. No model weights loaded.')
+        say(f'NVFP4/sampling preflight: compiling/running small CUDA operations; MAX_JOBS={config.max_jobs}. No model weights loaded.')
         output = run_logged([python,str(SCRIPT),'_nvfp4'],config,'nvfp4-preflight',config.jit_timeout)
         record['kernel'] = extract_result(output)
         if not isinstance(record['kernel'],dict) or not record['kernel'].get('ok'):
@@ -545,7 +560,7 @@ def run_preflight(config, python, *, check_dependencies=True):
     finally:
         record['after'] = memory_status()
         save_json(config.state/'logs/preflight.json',record)
-    say('PREFLIGHT OK: dependencies, build tools and NVFP4 CUTLASS execution verified.')
+    say('PREFLIGHT OK: dependencies, build tools, NVFP4 CUTLASS and sampling execution verified.')
     return record
 
 
@@ -744,7 +759,7 @@ def start(config, python, model, *, preflight_done=False):
             if process.poll() is not None:
                 raise startup_error(config,f'Server exited (code {process.returncode})',log_path)
             if ready(config):
-                smoke(config)
+                warmup(config,python)
                 MANAGED_CHILDREN[process.pid] = process
                 say(f'READY: {config.url}/v1 ; model={config.model}'); return
             if time.monotonic() >= next_update:
@@ -816,12 +831,20 @@ def stop(config):
     say('Managed server stopped; runtime and model cache preserved.')
 
 
-def smoke(config):
+def warmup(config, python):
+    """Give first-token CUDA JIT its own deadline and a cancellable progress worker."""
+    say(f'First inference: allowing up to {config.warmup_timeout}s for cold CUDA compilation. '
+        f'Progress: tail -f {config.state/"logs/server.log"}')
+    run_logged([python,str(SCRIPT),'_smoke',str(config.state)],config,'warmup',config.warmup_timeout+10)
+    say(f'First inference verified. Result: {config.state/"logs/warmup.log"}')
+
+
+def smoke(config, *, timeout=120):
     if not ready(config):
         raise SetupError('Expected model is not ready. Inspect status or server.log.')
     response = request_json(config,'/v1/chat/completions',{
         'model':config.model,'messages':[{'role':'user','content':'Reply with exactly OK.'}],
-        'max_tokens':64,'temperature':0.7,'chat_template_kwargs':{'enable_thinking':False}},timeout=120)
+        'max_tokens':64,'temperature':0.7,'chat_template_kwargs':{'enable_thinking':False}},timeout=timeout)
     try:
         content = response['choices'][0]['message']['content']
     except (KeyError,IndexError,TypeError) as exc:
@@ -910,6 +933,11 @@ def entrypoint():
         if hasattr(signal,name):
             signal.signal(getattr(signal,name),interrupted)
     try:
+        if len(sys.argv)>1 and sys.argv[1]=='_smoke':
+            record = load_json(Path(sys.argv[2])/'server.json')
+            config = Config(**record['config'])
+            smoke(config,timeout=config.warmup_timeout)
+            return 0
         return main()
     except KeyboardInterrupt:
         say('Interrupted. Current child operation stopped; cached downloads preserved.'); return 130

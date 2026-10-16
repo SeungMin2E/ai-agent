@@ -5,9 +5,9 @@ RTX 5090 한 장에서 `Inferact/Qwen3.8-27B-NVFP4`를 vLLM으로 실행합니�
 
 ## 개발 PC의 GitHub 자동 업로드
 
-원본 Windows 개발 폴더는 별도 감시 프로그램으로 이 저장소에 연결되어 있습니다. 저장 후 60초 동안 추가 변경이 없으면 로컬 테스트를 통과한 변경을 `main`에 자동 커밋합니다. PC가 켜져 있고 로그인 및 인터넷 연결이 필요합니다. 테스트 실패나 GitHub의 같은 파일과 충돌이 있으면 업로드를 보류합니다.
+**2026-10-16 사용자 요청으로 ai-agent 자동 업로드를 다시 켰습니다.** 원본 Windows 개발 폴더를 저장한 뒤 60초 동안 추가 변경이 없으면 로컬 테스트를 통과한 변경을 `main`에 자동 커밋합니다. PC가 켜져 있고 로그인 및 인터넷 연결이 필요합니다. 테스트 실패나 GitHub의 같은 파일과 충돌이 있으면 업로드를 보류합니다.
 
-감시 설정과 켜기·끄기·상태 확인 버튼은 개발 PC의 `Deeppoint\github-auto-upload` 폴더에 있습니다. 이 기능은 원본 개발 PC에만 설정되며, RunPod에서 저장소를 가져오는 것만으로 활성화되지는 않습니다. RunPod에 최신 설정을 가져오려면 저장소 폴더에서 `git pull --ff-only`를 실행하세요.
+감시 설정과 켜기·끄기·상태 확인 버튼은 개발 PC의 `Deeppoint\github-auto-upload` 폴더에 있습니다. ai-agent와 테스트 사이트 두 폴더만 자동 업로드하며 Windows 로그인 후에도 감시를 시작합니다. RunPod에는 자동으로 배포하지 않으므로 저장소 폴더에서 `git pull --ff-only`로 최신 수정본을 가져오고 실행해야 합니다. RunPod에서 파일을 직접 수정한 경우에는 먼저 변경 내용을 확인하고 보관하세요.
 
 ## 실행
 
@@ -65,6 +65,7 @@ Pod 재시작 후 자동 부팅되지는 않으므로 `bash setup.sh start`를 �
 | 모델 캐시 | `/workspace/hf-cache` |
 | 상태·런타임·로그 | `/workspace/ai-agent-state` |
 | 준비 제한 | 900초 |
+| 첫 답변·초기 CUDA 컴파일 제한 | `WARMUP_TIMEOUT=1800`초 — 모델 준비 제한과 별도 |
 | 설치 / 다운로드 제한 | 시도당 3,600초 / 10,800초 |
 | NVFP4 사전 검사 제한 | 1,800초 |
 | JIT 빌드 동시 작업 | `MAX_JOBS=1` — 호스트 RAM 사용 억제 |
@@ -79,7 +80,7 @@ bash setup.sh
 ```
 
 지원 변수: `WORKSPACE`, `STATE_DIR`, `HF_HOME`, `MODEL_ID`, `MODEL_REVISION`, `VLLM_VERSION`, `HOST`, `PORT`,
-`MAX_MODEL_LEN`, `MAX_NUM_SEQS`, `GPU_MEMORY_UTILIZATION`, `STARTUP_TIMEOUT`, `INSTALL_TIMEOUT`, `DOWNLOAD_TIMEOUT`, `JIT_TIMEOUT`, `MAX_JOBS`, `RETRIES`.
+`MAX_MODEL_LEN`, `MAX_NUM_SEQS`, `GPU_MEMORY_UTILIZATION`, `STARTUP_TIMEOUT`, `WARMUP_TIMEOUT`, `INSTALL_TIMEOUT`, `DOWNLOAD_TIMEOUT`, `JIT_TIMEOUT`, `MAX_JOBS`, `RETRIES`.
 `HOST`는 localhost 주소만 허용합니다. `CUDA_VISIBLE_DEVICES`는 지정값을 유지하고, 없으면 GPU 0을 사용합니다.
 32GB급 Blackwell GPU·단일 GPU용 프로필이며, 다른 모델은 메모리·아키텍처 호환성을 별도로 검토해야 합니다.
 
@@ -94,6 +95,8 @@ bash setup.sh
 - FlashInfer의 NVFP4 JIT 빌드에 필요한 `ninja`를 설치하고 실행 환경의 `PATH`에 선택한 Python 런타임의 `bin` 경로를 포함합니다. 기존 런타임을 재사용할 때도 누락된 Ninja를 보완합니다. 별도 시스템 런타임을 재사용하는 경우에는 작은 도구용 가상환경에 설치하여 시스템 패키지를 변경하지 않습니다.
 - 모델 다운로드·로딩 전에 Ninja, C++ 컴파일러, `nvcc` 실행을 확인하고 `STATE_DIR/logs/build-tools.json`에 기록합니다. C++ 컴파일러와 CUDA Toolkit이 빠진 이미지라면 개발 도구가 포함된 CUDA 이미지가 필요하다는 안내로 중단합니다.
 - 모델 다운로드·로딩 전에 FlashInfer의 실제 NVFP4 양자화 및 CUTLASS 행렬 연산을 128×128 입력으로 검사합니다. 작은 연산도 최초에는 필요한 CUDA 모듈을 컴파일하므로 시간이 걸립니다. 기존 FlashInfer 빌드 캐시는 삭제하지 않습니다.
+- 첫 토큰 생성에서 지연 로딩되는 FlashInfer `sampling` 모듈도 사전 검사에서 실제 연산으로 확인합니다. 모델 로딩 전에 컴파일하여 첫 답변의 대기 시간과 RAM 부담을 줄입니다.
+- 모델 API 준비 후 첫 답변 검사는 별도 프로세스로 최대 `WARMUP_TIMEOUT`초 기다립니다. 20초마다 대기 상태를 출력하고, 중단·시간 초과 시 검사 프로세스와 이번 실행의 모델 서버를 정리합니다. 일반 `test` 명령의 응답 제한은 120초입니다. 첫 답변 결과는 `logs/warmup.log`에 기록합니다.
 - 컴파일 동시 작업을 기본 1개로 제한합니다. 사전 검사 전후의 호스트 RAM 및 cgroup 메모리·OOM 카운터와 결과를 `STATE_DIR/logs/preflight.json`에 기록합니다. `code=137`·`Killed`는 시스템 RAM 관련 가능성을 별도로 안내하며 GPU 문맥 길이 조절로 일괄 안내하지 않습니다.
 - 재사용하는 런타임에도 `pip check`를 실행하여 의존성 불일치를 확인합니다. 서버 기동에 실패하면 마지막 요약 오류와 함께 앞쪽 원인 줄을 추출해 `STATE_DIR/logs/startup-failure.json`에 보존합니다.
 - 호환되는 기존 환경 재사용. 새 설치는 별도 가상환경에서 수행하여 시스템 PyTorch를 덮어쓰지 않음.
@@ -115,6 +118,7 @@ Linux에서는 새 상태 파일·로그를 현재 사용자만 읽도록 생성
 | `No module named 'vllm._C'` (예전 설치 스크립트) | 저장소에서 `git pull --ff-only` 후 `bash setup.sh` 재실행. vLLM 0.31의 확장 이름 변경을 반영한 검사 사용 |
 | `No such file or directory: 'ninja'` | 저장소에서 `git pull --ff-only` 후 `bash setup.sh` 재실행. Ninja 설치 및 런타임 PATH 보완을 자동 처리 |
 | Ninja 빌드 중 `code=137` / `Killed` | CUDA 컴파일러 강제 종료. `MAX_JOBS=1` 유지 후 `bash setup.sh preflight`로 먼저 확인. `diagnose`의 RAM 제한·OOM 카운터 대조 |
+| API 기동 후 `Building JIT module sampling` 중 첫 답변 시간 초과 | `git pull --ff-only`로 sampling 사전 검사와 별도 첫 답변 제한을 반영한 수정본 사용. `WARMUP_TIMEOUT=1800` 기본값 유지. 직접 수정한 파일 때문에 pull이 거부되면 해당 변경을 보관하고 충돌 확인 |
 | 포트 사용 중 | 기존 vLLM 확인 또는 다른 `PORT` 사용 |
 | GPU 메모리 부족 | `nvidia-smi` 확인. 다른 작업 정리 후 `MAX_MODEL_LEN=4096`부터 재시도 |
 | venv 생성 실패 | venv/ensurepip가 포함된 Python 3.12 GPU 이미지 사용. Ubuntu는 필요 시 `python3-venv` 설치 |
