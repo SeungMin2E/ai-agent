@@ -1,6 +1,7 @@
 import contextlib
 from dataclasses import replace
 import io
+import importlib.metadata
 import json
 import os
 from pathlib import Path
