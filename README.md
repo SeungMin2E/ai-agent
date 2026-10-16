@@ -60,6 +60,7 @@ Pod 재시작 후 자동 부팅되지는 않으므로 `bash setup.sh start`를 �
 | 최대 모델 길이 / 동시 요청 | `8192` / `1` |
 | GPU 메모리 비율 | `0.90` |
 | KV 캐시 / 추론 파서 | `fp8` / `qwen3` |
+| 자동 도구 호출 / 도구 파서 | `--enable-auto-tool-choice` / `qwen3_coder` |
 | CUDA graph | `--enforce-eager`로 비활성 |
 | API | `127.0.0.1:8000` |
 | 모델 캐시 | `/workspace/hf-cache` |
@@ -138,6 +139,10 @@ ssh -L 8000:127.0.0.1:8000 -p <SSH_PORT> root@<RUNPOD_SSH_HOST>
 ```
 
 터널을 유지한 상태에서 PC의 `http://127.0.0.1:8000/v1`로 접근합니다.
+
+LuaN1aoAgent처럼 자동 도구 호출을 사용하는 클라이언트를 위해 `--enable-auto-tool-choice --tool-call-parser qwen3_coder`를 지정합니다. 실행 중인 서버에는 옵션이 자동 적용되지 않으므로 수정본을 받은 뒤 관리 서버를 `stop`하고 `start`하여 적용합니다. 모델 재다운로드는 필요하지 않습니다.
+
+WSL에서 에이전트를 실행하면 SSH 터널도 WSL에서 여는 구성이 간단합니다. 예를 들어 로컬 포트 18000을 RunPod의 8000으로 연결한 경우, 에이전트의 `LLM_API_BASE_URL`은 `http://127.0.0.1:18000/v1`, 모델 ID는 `Inferact/Qwen3.8-27B-NVFP4`입니다. 현재 서버의 문맥 길이는 8192이므로 에이전트의 문맥·출력 제한도 이에 맞춰야 합니다.
 
 ## 검증
 

@@ -88,6 +88,8 @@ class ConfigurationTests(Base):
         self.assertIn('--enforce-eager',command)
         self.assertEqual(command[command.index('--kv-cache-dtype')+1],'fp8')
         self.assertEqual(command[command.index('--reasoning-parser')+1],'qwen3')
+        self.assertIn('--enable-auto-tool-choice',command)
+        self.assertEqual(command[command.index('--tool-call-parser')+1],'qwen3_coder')
         self.assertIn(str(self.root/'a model'),command)
 
     def test_ipv6_url_is_bracketed(self):

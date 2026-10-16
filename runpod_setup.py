@@ -714,7 +714,8 @@ def build_server_command(config, python, snapshot):
             '--served-model-name',config.model,'--host',config.host,'--port',str(config.port),
             '--tensor-parallel-size','1','--max-model-len',str(config.max_model_len),
             '--max-num-seqs',str(config.max_num_seqs),'--gpu-memory-utilization',str(config.gpu_memory_utilization),
-            '--kv-cache-dtype','fp8','--enforce-eager','--reasoning-parser','qwen3']
+            '--kv-cache-dtype','fp8','--enforce-eager','--reasoning-parser','qwen3',
+            '--enable-auto-tool-choice','--tool-call-parser','qwen3_coder']
 
 
 def existing_server(config):
