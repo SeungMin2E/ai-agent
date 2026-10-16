@@ -124,6 +124,15 @@ class FailureHandlingTests(Base):
         for output in ('nothing',app.MARKER+'{broken'):
             with self.assertRaises(app.SetupError): app.extract_result(output)
 
+    def test_error_guidance_matches_failure_instead_of_always_suggesting_oom(self):
+        extension = app.failure_hint("ModuleNotFoundError: No module named 'vllm._C'")
+        self.assertIn('extension',extension)
+        self.assertNotIn('MAX_MODEL_LEN',extension)
+        self.assertIn('MAX_MODEL_LEN',app.failure_hint('CUDA out of memory'))
+        self.assertIn('Disk space',app.failure_hint('Not enough space for model'))
+        self.assertIn('shared-library',app.failure_hint('libtorch_cuda.so: undefined symbol'))
+        self.assertIn('Port conflict',app.failure_hint('Port 8000 is occupied'))
+
     def test_readiness_requires_requested_model(self):
         cases = [({},False),([],False),({'data':None},False),({'data':[None]},False),
                  ({'data':[{'id':'another/model'}]},False),({'data':[{'id':self.config.model}]},True)]
@@ -227,6 +236,34 @@ class RuntimeExtensionTests(Base):
             app.probe_worker('0.31.0')
         self.assertFalse(emit.call_args.args[0]['ok'])
         self.assertIn('unexpected result',emit.call_args.args[0]['error'])
+
+    def test_extension_failure_reports_stage_and_installed_versions(self):
+        modules,torch = self.probe_modules()
+        with patch.dict(sys.modules,modules),patch('importlib.metadata.version',return_value='0.31.0'),\
+             patch.object(app,'load_vllm_extension',side_effect=ImportError('undefined symbol')),patch.object(app,'emit') as emit:
+            app.probe_worker('0.31.0')
+        result = emit.call_args.args[0]
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['stage'],'vllm_extension')
+        self.assertEqual(result['vllm'],'0.31.0')
+        self.assertEqual(result['torch'],'2.13.0+cu130')
+        torch.ops._C.rms_norm.assert_not_called()
+
+    def test_probe_persists_runtime_failure_diagnostics(self):
+        data = {'ok':False,'stage':'vllm_extension','error':'extension missing'}
+        output = types.SimpleNamespace(stdout=app.MARKER+json.dumps(data))
+        with patch.object(app.subprocess,'run',return_value=output):
+            self.assertEqual(app.probe('runtime-python',self.config),data)
+        record = app.load_json(self.config.state/'logs/runtime-check.json')
+        self.assertEqual(record['result'],data)
+        self.assertEqual(record['python_executable'],'runtime-python')
+
+    def test_probe_timeout_is_reported_and_saved(self):
+        with patch.object(app.subprocess,'run',side_effect=subprocess.TimeoutExpired(['python'],120)):
+            data = app.probe('runtime-python',self.config)
+        self.assertFalse(data['ok'])
+        self.assertEqual(data['stage'],'probe_process')
+        self.assertEqual(app.load_json(self.config.state/'logs/runtime-check.json')['result'],data)
 
 
 class CacheTests(Base):

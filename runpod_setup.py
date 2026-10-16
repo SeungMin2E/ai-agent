@@ -240,27 +240,37 @@ def load_vllm_extension():
 
 
 def probe_worker(version):
+    details = {'python':sys.version.split()[0], 'python_executable':sys.executable}
+    stage = 'package_imports'
     try:
         import importlib.metadata as metadata
         from packaging.version import Version
         import torch
-        extension = load_vllm_extension()
         import transformers
         import huggingface_hub
         installed = metadata.version('vllm')
+        details.update(vllm=installed,torch=torch.__version__,cuda=torch.version.cuda,
+                       transformers=transformers.__version__,huggingface_hub=huggingface_hub.__version__)
+        stage = 'package_versions'
         if Version(installed).base_version != Version(version).base_version:
             raise RuntimeError(f'vLLM {installed} is installed; expected {version}')
         if Version(transformers.__version__) < Version('5.8.0'):
             raise RuntimeError(f'transformers {transformers.__version__} is older than 5.8.0')
+        stage = 'cuda_runtime'
         if not torch.cuda.is_available():
             raise RuntimeError('PyTorch cannot access CUDA. Check the RunPod GPU and driver/image compatibility.')
         if torch.cuda.get_device_capability(0)[0] < 10:
-            emit({'ok':False,'hardware_error':True,'error':'This NVFP4 profile needs an NVIDIA Blackwell GPU (RTX 5090 or compatible).'}); return
+            emit(dict(details,ok=False,stage=stage,hardware_error=True,error='This NVFP4 profile needs an NVIDIA Blackwell GPU (RTX 5090 or compatible).')); return
         free,total = torch.cuda.mem_get_info(0)
         if total < 30*GIB:
-            emit({'ok':False,'hardware_error':True,'error':f'This profile needs a 32 GB-class GPU; CUDA reports {total/GIB:.1f} GiB.'}); return
+            emit(dict(details,ok=False,stage=stage,hardware_error=True,error=f'This profile needs a 32 GB-class GPU; CUDA reports {total/GIB:.1f} GiB.')); return
         if not torch.version.cuda or Version(torch.version.cuda) < Version('12.8'):
             raise RuntimeError('Blackwell requires a CUDA 12.8+ PyTorch build.')
+        details.update(gpu=torch.cuda.get_device_name(0),free_bytes=free,total_bytes=total)
+        stage = 'vllm_extension'
+        extension = load_vllm_extension()
+        details['extension'] = extension
+        stage = 'vllm_cuda_kernel'
         inputs = torch.ones((1,128),device='cuda',dtype=torch.float16)
         weight = torch.ones(128,device='cuda',dtype=torch.float16)
         output = torch.empty_like(inputs)
@@ -268,13 +278,9 @@ def probe_worker(version):
         torch.cuda.synchronize()
         if not torch.allclose(output,torch.ones_like(output),atol=1e-3,rtol=1e-3):
             raise RuntimeError('vLLM CUDA RMSNorm verification returned an unexpected result.')
-        emit({'ok':True,'python':sys.version.split()[0],'vllm':installed,'torch':torch.__version__,
-              'extension':extension,'kernel_check':'rms_norm',
-              'cuda':torch.version.cuda,'transformers':transformers.__version__,
-              'huggingface_hub':huggingface_hub.__version__,'gpu':torch.cuda.get_device_name(0),
-              'free_bytes':free,'total_bytes':total})
+        emit(dict(details,ok=True,stage='complete',kernel_check='rms_norm'))
     except Exception as exc:
-        emit({'ok':False,'error':redact(f'{type(exc).__name__}: {exc}')})
+        emit(dict(details,ok=False,stage=stage,error=redact(f'{type(exc).__name__}: {exc}')))
 
 
 def probe(python, config):
@@ -282,9 +288,37 @@ def probe(python, config):
         result = subprocess.run([str(python),str(SCRIPT),'_probe',config.vllm_version],
                                 env=config.environment(),capture_output=True,text=True,
                                 encoding='utf-8',errors='replace',timeout=120)
-        return extract_result(result.stdout)
+        data = extract_result(result.stdout)
     except (OSError,subprocess.TimeoutExpired,SetupError) as exc:
-        return {'ok':False,'error':redact(str(exc))}
+        data = {'ok':False,'stage':'probe_process','error':redact(str(exc))}
+    save_json(config.state/'logs/runtime-check.json',
+              {'checked_at':datetime.now().astimezone().isoformat(timespec='seconds'),
+               'python_executable':str(python),'result':data})
+    return data
+
+
+def failure_hint(error):
+    """Offer the relevant next step, instead of showing an OOM hint for all errors."""
+    text = str(error).lower()
+    if 'no vllm cuda extension' in text or "no module named 'vllm." in text:
+        return ('vLLM extension check failed. Update this repository, inspect logs/runtime-check.json, '
+                'and verify the installed GPU wheel. Cached models are preserved.')
+    if any(word in text for word in ('undefined symbol','libtorch','libcudart','libcuda.so')):
+        return ('CUDA/PyTorch shared-library mismatch. Inspect logs/runtime-check.json and install logs; '
+                'use a compatible isolated vLLM runtime before changing system packages.')
+    if 'out of memory' in text or 'gpu busy:' in text:
+        return ('GPU memory: inspect nvidia-smi; use MAX_MODEL_LEN=4096 if needed. '
+                'Unrelated GPU processes were not stopped.')
+    if 'not enough space' in text or 'no space left' in text:
+        return ('Disk space: inspect df -h /workspace and expand storage if needed. '
+                'Existing model caches were not deleted.')
+    if 'occupied' in text or 'address already in use' in text:
+        return 'Port conflict: inspect the existing service or select another PORT; no other service was stopped.'
+    if '401' in text or '403' in text:
+        return 'Access denied: check the model access policy and HF_TOKEN. Do not paste credentials into logs or the repository.'
+    if 'modulenotfounderror' in text or 'no module named' in text:
+        return 'Python dependency missing: inspect logs/runtime-check.json and the isolated runtime install log.'
+    return 'Inspect the stage and log path printed above; runtime details are in STATE_DIR/logs/runtime-check.json.'
 
 
 def terminate_spawned(process):
@@ -361,7 +395,9 @@ def choose_runtime(config):
     run_logged([python,'-m','pip','check'],config,'pip-check',60)
     result = probe(python,config)
     if not result.get('ok'):
-        raise SetupError(f'Installed runtime failed CUDA/extension verification: {result.get("error")}. Inspect logs; host drivers were not modified.')
+        raise SetupError(f'Installed runtime verification failed at {result.get("stage","unknown")}: '
+                         f'{result.get("error")}. Diagnostics: {config.state/"logs/runtime-check.json"}. '
+                         'Host drivers were not modified.')
     save_json(config.state/'runtime.json',{'python':str(python),'probe':result})
     return str(python),result
 
@@ -680,7 +716,7 @@ def entrypoint():
         say('Interrupted. Current child operation stopped; cached downloads preserved.'); return 130
     except (SetupError,OSError,subprocess.SubprocessError,ValueError) as exc:
         say(f'ERROR: {type(exc).__name__}: {exc}')
-        say('Inspect STATE_DIR/logs. For GPU OOM: inspect nvidia-smi, lower MAX_MODEL_LEN, keep --enforce-eager.')
+        say(failure_hint(exc))
         return 1
 
 

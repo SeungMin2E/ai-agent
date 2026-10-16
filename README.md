@@ -86,6 +86,7 @@ bash setup.sh
 
 - Python 3.10~3.13, GPU 드라이버, vLLM 확장 모듈, CUDA 커널 실행, GPU 종류·용량 확인.
 - vLLM 0.31의 `vllm._C_stable_libtorch` 확장을 우선 확인하고, 구버전은 `vllm._C`를 사용합니다. 확장 모듈 로드 후 vLLM RMSNorm CUDA 커널의 실행 결과도 검사합니다.
+- 실패한 검사 단계와 확인된 Python·vLLM·PyTorch·CUDA 버전은 `STATE_DIR/logs/runtime-check.json`에 기록합니다. 확장 모듈 오류, 라이브러리 불일치, GPU 메모리 부족, 디스크 부족, 포트 충돌은 원인별 조치 안내를 출력합니다.
 - 호환되는 기존 환경 재사용. 새 설치는 별도 가상환경에서 수행하여 시스템 PyTorch를 덮어쓰지 않음.
 - 별도 런타임 설치 전 20GiB 여유 확인. 모델 다운로드 전 파일 크기·캐시를 대조하여 미다운로드 용량 + 3GiB 확인.
 - 네트워크 시간 초과 등 일시 오류만 제한 재시도. 401·403·404와 디스크 부족 등은 즉시 보고.
