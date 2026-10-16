@@ -170,12 +170,21 @@ class Config:
         host = f'[{self.host}]' if ':' in self.host else self.host
         return f'http://{host}:{self.port}'
 
-    def environment(self):
+    def environment(self, python=None):
         env = os.environ.copy()
         env.update(HF_HOME=self.hf_home, HF_HUB_CACHE=str(Path(self.hf_home)/'hub'),
                    VLLM_CACHE_ROOT=str(self.state/'vllm-cache'), PIP_CACHE_DIR=str(self.state/'pip-cache'),
                    TMPDIR=str(self.state/'tmp'), PYTHONUNBUFFERED='1')
         env.setdefault('CUDA_VISIBLE_DEVICES', '0')
+        # Calling /venv/bin/python does not activate /venv/bin for child executables.
+        # FlashInfer launches ninja/nvcc by name, so pass their search path explicitly.
+        bins = [str(self.state/'tools-venv/bin')]
+        if python is not None:
+            bins.insert(0,str(Path(python).absolute().parent))
+        for home in (env.get('CUDA_HOME'),env.get('CUDA_PATH'),'/usr/local/cuda'):
+            if home and (Path(home)/'bin').is_dir():
+                bins.append(str(Path(home)/'bin'))
+        env['PATH'] = os.pathsep.join(bins+[env.get('PATH',os.defpath)])
         return env
 
 
@@ -286,7 +295,7 @@ def probe_worker(version):
 def probe(python, config):
     try:
         result = subprocess.run([str(python),str(SCRIPT),'_probe',config.vllm_version],
-                                env=config.environment(),capture_output=True,text=True,
+                                env=config.environment(python),capture_output=True,text=True,
                                 encoding='utf-8',errors='replace',timeout=120)
         data = extract_result(result.stdout)
     except (OSError,subprocess.TimeoutExpired,SetupError) as exc:
@@ -300,6 +309,9 @@ def probe(python, config):
 def failure_hint(error):
     """Offer the relevant next step, instead of showing an OOM hint for all errors."""
     text = str(error).lower()
+    if 'ninja' in text and ('no such file' in text or 'missing' in text or 'not found' in text):
+        return ('FlashInfer JIT build tool ninja is unavailable. Update this repository and run bash setup.sh; '
+                'setup installs ninja and supplies the runtime bin directory in PATH. Model caches are preserved.')
     if 'no vllm cuda extension' in text or "no module named 'vllm." in text:
         return ('vLLM extension check failed. Update this repository, inspect logs/runtime-check.json, '
                 'and verify the installed GPU wheel. Cached models are preserved.')
@@ -343,7 +355,7 @@ def run_logged(args, config, label, timeout):
     path = config.state/'logs'/f'{label}.log'
     with path.open('w',encoding='utf-8') as log:
         say(f'{label}: started. Log: {path}')
-        process = subprocess.Popen([str(x) for x in args],env=config.environment(),stdin=subprocess.DEVNULL,
+        process = subprocess.Popen([str(x) for x in args],env=config.environment(args[0]),stdin=subprocess.DEVNULL,
                                    stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
         deadline,next_update = time.monotonic()+timeout,time.monotonic()+20
         try:
@@ -390,7 +402,7 @@ def choose_runtime(config):
         raise SetupError('Virtual environment could not be created. Use an image with Python venv/ensurepip support.')
     retry(lambda: run_logged([python,'-m','pip','install','--disable-pip-version-check','--timeout','60',
                              '--retries','2','--only-binary=vllm,torch',f'vllm=={config.vllm_version}',
-                             'transformers>=5.8.0,<6','huggingface_hub>=0.34,<2'],
+                              'transformers>=5.8.0,<6','huggingface_hub>=0.34,<2','ninja>=1.11,<2'],
                              config,'install',config.install_timeout),config.retries)
     run_logged([python,'-m','pip','check'],config,'pip-check',60)
     result = probe(python,config)
@@ -400,6 +412,46 @@ def choose_runtime(config):
                          'Host drivers were not modified.')
     save_json(config.state/'runtime.json',{'python':str(python),'probe':result})
     return str(python),result
+
+
+def ensure_build_tools(config, python):
+    """Repair missing Ninja without replacing torch/vLLM; check JIT tools before weights load."""
+    env = config.environment(python)
+    if not shutil.which('ninja',path=env['PATH']):
+        managed = config.state/'venv/bin/python'
+        if Path(python).absolute() == managed.absolute():
+            installer = str(python)
+        else:
+            # A compatible system runtime can be reused without modifying its packages.
+            installer = str(config.state/'tools-venv/bin/python')
+            if not Path(installer).exists():
+                run_logged([sys.executable,'-m','venv',str(config.state/'tools-venv')],
+                           config,'build-tools-venv',120)
+        retry(lambda: run_logged([installer,'-m','pip','install','--disable-pip-version-check',
+                                 '--timeout','60','--retries','2','--only-binary=ninja','ninja>=1.11,<2'],
+                                 config,'build-tools-install',config.install_timeout),config.retries)
+    env = config.environment(python)
+    tools = {'ninja':shutil.which('ninja',path=env['PATH']),
+             'cxx':shutil.which(env.get('CXX','c++'),path=env['PATH']),
+             'nvcc':shutil.which(env.get('CUDACXX','nvcc'),path=env['PATH'])}
+    missing = [name for name,path in tools.items() if not path]
+    if missing:
+        raise SetupError('Missing FlashInfer JIT build tools: ' + ', '.join(missing) + '. '
+                         'Use a CUDA development image with a C++ compiler and nvcc. '
+                         'Ninja is installed automatically; model weights have not been loaded.')
+    versions = {}
+    for name,path in tools.items():
+        try:
+            result = subprocess.run([path,'--version'],env=env,capture_output=True,text=True,
+                                    encoding='utf-8',errors='replace',timeout=20)
+        except (OSError,subprocess.TimeoutExpired) as exc:
+            raise SetupError(f'FlashInfer build tool {name} could not run: {exc}') from exc
+        if result.returncode:
+            raise SetupError(f'FlashInfer build tool {name} failed its version check (exit {result.returncode}).')
+        versions[name] = {'path':path,'version':redact((result.stdout+result.stderr).strip()[:1200])}
+    save_json(config.state/'logs/build-tools.json',versions)
+    say('FlashInfer JIT tools verified: ninja, C++ compiler, nvcc.')
+    return versions
 
 
 def complete_snapshot(path):
@@ -543,12 +595,13 @@ def start(config, python, model):
     budget = result['total_bytes']*config.gpu_memory_utilization
     if result['free_bytes'] < budget:
         raise SetupError(f'GPU busy: {result["free_bytes"]/GIB:.1f} GiB free; requested budget {budget/GIB:.1f} GiB. Inspect nvidia-smi; unrelated processes were not killed.')
+    ensure_build_tools(config,python)
     save_json(config.state/'launch.json',{'command':build_server_command(config,python,model['snapshot'])})
     log_path = config.state/'logs/server.log'
     if log_path.exists():
         os.replace(log_path,log_path.with_name(f'server-{time.time_ns()}.log'))
     with log_path.open('w',encoding='utf-8') as log:
-        process = subprocess.Popen([str(python),str(SCRIPT),'_serve',str(config.state)],env=config.environment(),
+        process = subprocess.Popen([str(python),str(SCRIPT),'_serve',str(config.state)],env=config.environment(python),
                                    stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
     try:
         record = process_identity(process.pid)
@@ -559,7 +612,7 @@ def start(config, python, model):
         deadline,next_update = time.monotonic()+config.startup_timeout,0
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                raise SetupError(f'Server exited (code {process.returncode}).\n{tail(log_path)}')
+                raise SetupError(f'Server exited (code {process.returncode}). Log: {log_path}\n{tail(log_path,64000)}')
             if ready(config):
                 MANAGED_CHILDREN[process.pid] = process
                 say(f'READY: {config.url}/v1 ; model={config.model}'); return
@@ -694,6 +747,7 @@ def main(argv=None):
         else:
             python,result = choose_runtime(config)
             say(f'CUDA verified: PyTorch {result["torch"]}, CUDA {result["cuda"]}.')
+            ensure_build_tools(config,python)
             start(config,python,download(config,python))
     return 0
 
